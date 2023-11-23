@@ -23,12 +23,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+
 	"github.com/go-logr/logr"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
-	"strconv"
-	"strings"
 )
 
 type kafkaPQScaler struct {
@@ -213,7 +214,7 @@ func (s *kafkaPQScaler) GetMetricsAndActivity(_ context.Context, metricName stri
 	// scale if lag is high in base queue and low in priority queues
 	totalLag, totalLagWithPersistent, err := baseScaler.getTotalLag()
 	if err != nil {
-		baseScaler.logger.V(1).Error(err, fmt.Sprintf("[IGNORE] error get lag from base scaler topic [%s] for consumer [%s] : %w", baseScaler.metadata.topic, baseScaler.metadata.group, err))
+		baseScaler.logger.V(1).Error(err, fmt.Sprintf("[IGNORE] error get lag from base scaler topic [%s] for consumer [%s] : %v", baseScaler.metadata.topic, baseScaler.metadata.group, err))
 		return externalMetricsValues, false, err
 	}
 
@@ -239,14 +240,14 @@ func (s *kafkaPQScaler) Close(ctx context.Context) error {
 	for _, pqS := range priorityScalers {
 		err := pqS.Close(ctx)
 		if err != nil {
-			baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing priority scaler %w", err))
+			baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing priority scaler %v", err))
 			return err
 		}
 	}
 
 	err := baseScaler.Close(ctx)
 	if err != nil {
-		baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing priority scaler %w", err))
+		baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing priority scaler %v", err))
 		return err
 	}
 	return nil
