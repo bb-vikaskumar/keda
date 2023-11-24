@@ -56,6 +56,7 @@ func NewKafkaPQScaler(config *ScalerConfig) (Scaler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error parsing priority queue kafka metadata: %w", err)
 	}
+	logger.Info(fmt.Sprintf("Parsed. baseMeta: %+v, pqMetas: %+v", baseMeta, pqMetas))
 
 	client, admin, err := getKafkaClients(baseMeta)
 	if err != nil {
@@ -67,7 +68,7 @@ func NewKafkaPQScaler(config *ScalerConfig) (Scaler, error) {
 		pqScaler := kafkaScaler{
 			client:          client,
 			admin:           admin,
-			metricType:      "",
+			metricType:      v2.ValueMetricType,
 			metadata:        pqMeta,
 			logger:          logger,
 			previousOffsets: make(map[string]map[int32]int64),
@@ -105,14 +106,14 @@ func parseKafkaPQMetadata(config *ScalerConfig, logger logr.Logger) (kafkaMetada
 
 	for _, cpqMeta := range customPQMetas {
 		pqConfig := *config
-		pqConfig.TriggerMetadata["consumerGroupFromEnv"] = cpqMeta.group
+		pqConfig.TriggerMetadata["consumerGroupFromEnv"] = ""
 		pqConfig.TriggerMetadata["consumerGroup"] = cpqMeta.group
-		pqConfig.TriggerMetadata["topicFromEnv"] = cpqMeta.topic
+		pqConfig.TriggerMetadata["topicFromEnv"] = ""
 		pqConfig.TriggerMetadata["topic"] = cpqMeta.topic
 		pqConfig.TriggerMetadata["lagThreshold"] = cpqMeta.maxAllowedLag
-		pqMeta, err := parseKafkaMetadata(config, logger)
+		pqMeta, err := parseKafkaMetadata(&pqConfig, logger)
 		if err != nil {
-			return baseMeta, pqMetas, fmt.Errorf("error parsing kafka priority queue (%v) metadata: %w", pqMeta, err)
+			return baseMeta, pqMetas, fmt.Errorf("error parsing kafka priority queue (%+v) metadata: %w", pqConfig, err)
 		}
 
 		pqMetas = append(pqMetas, pqMeta)
@@ -132,7 +133,7 @@ func getCustomPQMetadata(priorityQueuesStr string) ([]customPriorityQueueMetadat
 	for _, pqStr := range priorityQueuesSplits {
 		pqSplits := strings.Split(pqStr, ":")
 		if len(pqSplits) != 3 {
-			return pqMetaList, errors.New("priority queue config should is invalid")
+			return pqMetaList, errors.New("priority queue config is invalid")
 		}
 
 		pqTopic := strings.TrimSpace(pqSplits[0])
@@ -165,22 +166,39 @@ func getCustomPQMetadata(priorityQueuesStr string) ([]customPriorityQueueMetadat
 
 func (s *kafkaPQScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	baseScaler := s.baseKafkaScaler
-	var metricName string
+	priorityScalers := s.pqKafkaScalers
+	var metricSpecs []v2.MetricSpec
+
+	var baseMetricName string
 	if baseScaler.metadata.topic != "" {
-		metricName = fmt.Sprintf("kafka-%s", baseScaler.metadata.topic)
+		baseMetricName = fmt.Sprintf("kafka-%s", baseScaler.metadata.topic)
 	} else {
-		metricName = fmt.Sprintf("kafka-%s-topics", baseScaler.metadata.group)
+		baseMetricName = fmt.Sprintf("kafka-%s-topics", baseScaler.metadata.group)
 	}
 
-	externalMetric := &v2.ExternalMetricSource{
+	baseExternalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(baseScaler.metadata.scalerIndex, kedautil.NormalizeString(metricName)),
+			Name: GenerateMetricNameWithIndex(baseScaler.metadata.scalerIndex, kedautil.NormalizeString(baseMetricName)),
 		},
 		Target: GetMetricTarget(baseScaler.metricType, baseScaler.metadata.lagThreshold),
 	}
-	metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
-	baseScaler.logger.V(1).Info(fmt.Sprintf("metric spec: %v", metricSpec))
-	return []v2.MetricSpec{metricSpec}
+	baseMetricSpec := v2.MetricSpec{External: baseExternalMetric, Type: kafkaMetricType}
+
+	for _, ps := range priorityScalers {
+		metricName := fmt.Sprintf("kafka-pq-%s", ps.metadata.topic)
+		externalMetric := &v2.ExternalMetricSource{
+			Metric: v2.MetricIdentifier{
+				Name: GenerateMetricNameWithIndex(ps.metadata.scalerIndex, kedautil.NormalizeString(metricName)),
+			},
+			Target: GetMetricTarget(ps.metricType, ps.metadata.lagThreshold),
+		}
+		metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
+		metricSpecs = append(metricSpecs, metricSpec)
+	}
+
+	metricSpecs = append(metricSpecs, baseMetricSpec)
+	baseScaler.logger.Info(fmt.Sprintf("metric specs: %+v", metricSpecs))
+	return metricSpecs
 }
 
 // GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
@@ -190,31 +208,38 @@ func (s *kafkaPQScaler) GetMetricsAndActivity(_ context.Context, metricName stri
 	var externalMetricsValues []external_metrics.ExternalMetricValue
 	descaleRequired := false
 
+	baseScaler.logger.Info(fmt.Sprintf("requested metrics and activity for: %s", metricName))
+
 	for _, ps := range priorityScalers {
-		pqMetricName := metricName + "-pq-" + ps.metadata.topic + ps.metadata.group
+		pqMetricName := fmt.Sprintf("kafka-pq-%s", ps.metadata.topic)
+		pqMetricName = GenerateMetricNameWithIndex(ps.metadata.scalerIndex, kedautil.NormalizeString(pqMetricName))
+
 		totalLag, totalLagWithPersistent, err := ps.getTotalLag()
 		if err != nil {
 			baseScaler.logger.V(1).Error(err, "[IGNORE] error get lag from priority scaler topic [%s] for consumer [%s] : %w", ps.metadata.topic, ps.metadata.group, err)
-			metric := GenerateMetricInMili(pqMetricName, float64(0))
-			externalMetricsValues = append(externalMetricsValues, metric)
 			continue
 		}
 
-		metric := GenerateMetricInMili(pqMetricName, float64(totalLag))
-		pqCritical := totalLagWithPersistent > ps.metadata.activationLagThreshold
+		metric := GenerateMetricInMili(pqMetricName, float64(0))
+		if totalLag > 0 {
+			metric = GenerateMetricInMili(pqMetricName, float64(1/totalLag))
+		}
 
+		externalMetricsValues = append(externalMetricsValues, metric)
+
+		pqCritical := totalLagWithPersistent > ps.metadata.activationLagThreshold
 		if pqCritical {
 			descaleRequired = true
-			baseScaler.logger.V(1).Info(fmt.Sprintf("[DESCALING] lag [%d] in priority scaler topic [%s] for consumer [%s] is high", totalLagWithPersistent, ps.metadata.topic, ps.metadata.group))
-			externalMetricsValues = append(externalMetricsValues, metric)
+			baseScaler.logger.Info(fmt.Sprintf("[DESCALING] lag [%d] in priority scaler topic [%s] for consumer [%s] is high", totalLagWithPersistent, ps.metadata.topic, ps.metadata.group))
+		} else {
+			baseScaler.logger.Info(fmt.Sprintf("[IGNORE] lag [%d] in priority scaler topic [%s] for consumer [%s] in check", totalLagWithPersistent, ps.metadata.topic, ps.metadata.group))
 		}
-		baseScaler.logger.V(1).Info(fmt.Sprintf("[IGNORE] lag [%d] in priority scaler topic [%s] for consumer [%s] in check", totalLagWithPersistent, ps.metadata.topic, ps.metadata.group))
 	}
 
 	// scale if lag is high in base queue and low in priority queues
 	totalLag, totalLagWithPersistent, err := baseScaler.getTotalLag()
 	if err != nil {
-		baseScaler.logger.V(1).Error(err, fmt.Sprintf("[IGNORE] error get lag from base scaler topic [%s] for consumer [%s] : %v", baseScaler.metadata.topic, baseScaler.metadata.group, err))
+		baseScaler.logger.V(1).Error(err, fmt.Sprintf("[IGNORE] error geting lag from base scaler topic [%s] for consumer [%s] : %v", baseScaler.metadata.topic, baseScaler.metadata.group, err))
 		return externalMetricsValues, false, err
 	}
 
@@ -225,29 +250,20 @@ func (s *kafkaPQScaler) GetMetricsAndActivity(_ context.Context, metricName stri
 
 	metric := GenerateMetricInMili(metricName, float64(totalLag))
 	externalMetricsValues = append(externalMetricsValues, metric)
-	scaleRequired := totalLagWithPersistent < baseScaler.metadata.activationLagThreshold
-	baseScaler.logger.V(1).Info(fmt.Sprintf("[SCALING? %t] lag [%d] in base scaler topic [%s] for consumer [%s]", scaleRequired, totalLagWithPersistent, baseScaler.metadata.topic, baseScaler.metadata.group))
-	baseScaler.logger.V(1).Info(fmt.Sprintf("external metrics values: %v", externalMetricsValues))
+	scaleRequired := totalLagWithPersistent > baseScaler.metadata.activationLagThreshold
+	baseScaler.logger.Info(fmt.Sprintf("[SCALING? %t] lag [%d] in base scaler topic [%s] for consumer [%s]", scaleRequired, totalLagWithPersistent, baseScaler.metadata.topic, baseScaler.metadata.group))
+	baseScaler.logger.Info(fmt.Sprintf("External Metrics Values: %+v", externalMetricsValues))
 
 	return externalMetricsValues, scaleRequired, nil
 }
 
 // Close closes the kafka admin and client
 func (s *kafkaPQScaler) Close(ctx context.Context) error {
-	priorityScalers := s.pqKafkaScalers
 	baseScaler := s.baseKafkaScaler
-
-	for _, pqS := range priorityScalers {
-		err := pqS.Close(ctx)
-		if err != nil {
-			baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing priority scaler %v", err))
-			return err
-		}
-	}
 
 	err := baseScaler.Close(ctx)
 	if err != nil {
-		baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing priority scaler %v", err))
+		baseScaler.logger.V(1).Error(err, fmt.Sprintf("error while closing base scaler %v", err))
 		return err
 	}
 	return nil
